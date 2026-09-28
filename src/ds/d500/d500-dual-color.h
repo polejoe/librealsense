@@ -46,6 +46,8 @@ namespace librealsense
         // Stream-id resolver: route color pins (NV12/M420/YUY2) to Color 1 / Color 2 streams
         static void resolve_color_stream( const std::vector< platform::stream_profile > & all,
                                           const platform::stream_profile & p, rs2_stream & type, int & index );
+        static void resolve_mipi_color_stream( const std::vector< platform::stream_profile > & all,
+                                               const platform::stream_profile & p, rs2_stream & type, int & index );
         static bool is_color_pin( const std::vector< platform::stream_profile > & all, uint32_t pin );
     };
 }

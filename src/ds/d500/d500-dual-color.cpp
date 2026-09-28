@@ -4,6 +4,7 @@
 #include "d500-dual-color.h"
 #include "d500-info.h"
 #include "environment.h"
+#include "frame.h"
 #include "metadata.h"
 #include "proc/color-formats-converter.h"  // m420_converter, nv12_converter
 #include <src/proc/identity-processing-block.h>
@@ -28,6 +29,69 @@ using rs_fourcc = rsutils::type::fourcc;
 
 namespace librealsense
 {
+    namespace
+    {
+        constexpr uint32_t source_2c_configuration_version = 4;
+
+        bool get_source_2c_index( const rs2::frame & f, int & stream_index )
+        {
+            auto frame_interface = reinterpret_cast< librealsense::frame_interface * >( f.get() );
+            auto frame = dynamic_cast< librealsense::frame * >( frame_interface );
+            if( ! frame )
+                return false;
+
+            constexpr size_t configuration_offset
+                = metadata_raw_mode_offset
+                + offsetof( md_rgb_mode, rgb_mode )
+                + offsetof( md_rgb_normal_mode, intel_configuration );
+            if( frame->additional_data.metadata_size < configuration_offset + sizeof( md_configuration ) )
+                return false;
+
+            auto configuration = reinterpret_cast< const md_configuration * >(
+                frame->additional_data.metadata_blob.data() + configuration_offset );
+            if( configuration->header.md_type_id != md_type::META_DATA_INTEL_CONFIGURATION_ID
+                || configuration->header.md_size < sizeof( md_configuration )
+                || configuration->version < source_2c_configuration_version
+                || configuration->reserved[0] > 1 )
+                return false;
+
+            // Configuration v4 assigns reserved[0] to source_2c: 0 = Left, 1 = Right.
+            stream_index = static_cast< int >( configuration->reserved[0] ) + 1;
+            return true;
+        }
+
+        rs2::frame retag_source_2c_frame( rs2::frame f, int stream_index )
+        {
+            auto frame = reinterpret_cast< librealsense::frame_interface * >( f.get() );
+            auto const & original_profile = frame->get_stream();
+            auto profile = original_profile->clone();
+            profile->set_format( original_profile->get_format() );
+            profile->set_stream_type( RS2_STREAM_COLOR );
+            profile->set_stream_index( stream_index );
+            frame->set_stream( std::move( profile ) );
+            return f;
+        }
+
+        template< class Base >
+        class source_2c_processing_block : public Base
+        {
+        public:
+            using Base::Base;
+
+        protected:
+            rs2::frame process_frame( const rs2::frame_source & source, const rs2::frame & f ) override
+            {
+                int stream_index = 0;
+                if( ! get_source_2c_index( f, stream_index ) )
+                    return {};
+                auto result = Base::process_frame( source, f );
+                if( ! result )
+                    return {};
+                return retag_source_2c_frame( std::move( result ), stream_index );
+            }
+        };
+    }
+
     // Image and calibration encodings published by the color pins.
     // The 16-bit raw can have several spellings: RW16 over USB (V4L2 passes it through, WMF normalizes it to BYR2)
     // and BA10 or GR16 over GMSL, depending on the d4xx driver version.
@@ -61,25 +125,48 @@ namespace librealsense
             raw_fourcc_to_rs2_stream_map->insert( { entry.first, RS2_STREAM_INFRARED } );
         }
 
-        raw_depth_sensor->set_stream_id_resolver( resolve_color_stream );
+        raw_depth_sensor->set_stream_id_resolver(
+            _is_mipi_device ? resolve_mipi_color_stream : resolve_color_stream );
 
-        // NV12 registered before M420 so RGB targets resolve to NV12 when present, and to M420 when it is not
-        // (converter breaks ties by registration order).
-        for( auto target : { RS2_FORMAT_RGB8, RS2_FORMAT_RGBA8, RS2_FORMAT_BGR8, RS2_FORMAT_BGRA8 } )
+        if( _is_mipi_device )
         {
-            depth_sensor.register_processing_block( { { RS2_FORMAT_NV12, RS2_STREAM_COLOR } },
-                                                      { { target, RS2_STREAM_COLOR, 1 }, { target, RS2_STREAM_COLOR, 2 } },
-                                                      [target]() { return std::make_shared< nv12_converter >( target ); } );
-            depth_sensor.register_processing_block( { { RS2_FORMAT_M420, RS2_STREAM_COLOR } },
-                                                      { { target, RS2_STREAM_COLOR, 1 }, { target, RS2_STREAM_COLOR, 2 } },
-                                                      [target]() { return std::make_shared< m420_converter >( target ); } );
-        }
+            // One MIPI pin carries both complete RGB frames; metadata v4 selects Color 1/2 per frame.
+            for( auto target : { RS2_FORMAT_RGB8, RS2_FORMAT_RGBA8, RS2_FORMAT_BGR8, RS2_FORMAT_BGRA8 } )
+            {
+                depth_sensor.register_processing_block(
+                    { { RS2_FORMAT_NV12, RS2_STREAM_ANY } },
+                    { { target, RS2_STREAM_COLOR, 1 }, { target, RS2_STREAM_COLOR, 2 } },
+                    [target]() { return std::make_shared< source_2c_processing_block< nv12_converter > >( target ); } );
+                depth_sensor.register_processing_block(
+                    { { RS2_FORMAT_M420, RS2_STREAM_ANY } },
+                    { { target, RS2_STREAM_COLOR, 1 }, { target, RS2_STREAM_COLOR, 2 } },
+                    [target]() { return std::make_shared< source_2c_processing_block< m420_converter > >( target ); } );
+            }
 
-        // Expose native image and calibration encodings as passthrough color profiles.
-        for( auto native : { RS2_FORMAT_NV12, RS2_FORMAT_M420, RS2_FORMAT_YUYV, RS2_FORMAT_RAW16 } )
-            depth_sensor.register_processing_block( { { native, RS2_STREAM_COLOR } },
-                                                      { { native, RS2_STREAM_COLOR, 1 }, { native, RS2_STREAM_COLOR, 2 } },
-                                                      []() { return std::make_shared< identity_processing_block >(); } );
+            for( auto native : { RS2_FORMAT_NV12, RS2_FORMAT_M420, RS2_FORMAT_YUYV, RS2_FORMAT_RAW16 } )
+                depth_sensor.register_processing_block(
+                    { { native, RS2_STREAM_ANY } },
+                    { { native, RS2_STREAM_COLOR, 1 }, { native, RS2_STREAM_COLOR, 2 } },
+                    []() { return std::make_shared< source_2c_processing_block< identity_processing_block > >(); } );
+        }
+        else
+        {
+            // Keep the established two-pin USB processing path unchanged.
+            for( auto target : { RS2_FORMAT_RGB8, RS2_FORMAT_RGBA8, RS2_FORMAT_BGR8, RS2_FORMAT_BGRA8 } )
+            {
+                depth_sensor.register_processing_block( { { RS2_FORMAT_NV12, RS2_STREAM_COLOR } },
+                                                        { { target, RS2_STREAM_COLOR, 1 }, { target, RS2_STREAM_COLOR, 2 } },
+                                                        [target]() { return std::make_shared< nv12_converter >( target ); } );
+                depth_sensor.register_processing_block( { { RS2_FORMAT_M420, RS2_STREAM_COLOR } },
+                                                        { { target, RS2_STREAM_COLOR, 1 }, { target, RS2_STREAM_COLOR, 2 } },
+                                                        [target]() { return std::make_shared< m420_converter >( target ); } );
+            }
+
+            for( auto native : { RS2_FORMAT_NV12, RS2_FORMAT_M420, RS2_FORMAT_YUYV, RS2_FORMAT_RAW16 } )
+                depth_sensor.register_processing_block( { { native, RS2_STREAM_COLOR } },
+                                                        { { native, RS2_STREAM_COLOR, 1 }, { native, RS2_STREAM_COLOR, 2 } },
+                                                        []() { return std::make_shared< identity_processing_block >(); } );
+        }
 
         // The color profiles are produced by the depth sensor; hand it the stream objects so it can assign them
         // (matched by stream type + index) when it builds its profiles.
@@ -420,6 +507,20 @@ namespace librealsense
         // Assign in descending order so the highest pin -> Color 1, matching infrared 1 / 2.
         type = RS2_STREAM_COLOR;
         index = static_cast< int >( color_pins.size() ) - rank;
+    }
+
+    void d500_dual_color::resolve_mipi_color_stream( const std::vector< platform::stream_profile > & all,
+                                                     const platform::stream_profile & p,
+                                                     rs2_stream & type,
+                                                     int & index )
+    {
+        if( color_pin_formats.count( p.format ) && is_color_pin( all, p.pin_index ) )
+        {
+            // Pixel-mode 2C carries both sources on one aggregate V4L2 node.
+            // The processing blocks above assign Color 1/2 per frame from metadata.
+            type = RS2_STREAM_COLOR;
+            index = 0;
+        }
     }
 
     // Identify a color pin: it advertises the native color format (M420 or NV12) paired with a YUY2/YUYV
