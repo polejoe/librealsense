@@ -131,6 +131,14 @@ class Collector:
         self.frames.setdefault( f.get_profile().stream_type(), [] ).append( info )
     def count(self, stream_type, since=0.):
         return sum( 1 for i in self.frames.get( stream_type, [] ) if i['time'] >= since )
+    def check_active(self, stream_type, since, end, minimum):
+        got = [i for i in self.frames.get( stream_type, [] ) if since <= i['time'] <= end]
+        assert len( got ) >= minimum, f"Too few {stream_type} frames: {len(got)}"
+        assert got[0]['time'] - since < 1, f"{stream_type} did not start promptly"
+        assert end - got[-1]['time'] < 1, f"{stream_type} stopped delivering before the step ended"
+        assert all( b['time'] - a['time'] < 1 for a, b in zip( got, got[1:] ) ), f"{stream_type} stalled"
+        log.info( "%s: %d frames, first wait %.3fs, tail silence %.3fs", stream_type, len( got ),
+                  got[0]['time'] - since, end - got[-1]['time'] )
 
 
 def test_perception_sensors_enumerate(device):
@@ -209,9 +217,16 @@ def test_pd_and_occ_independent(device):
         action()
         since = time.monotonic() + 0.6   # frames already in flight around a switch
         time.sleep( DURATION_S )
-        assert ( frames.count( rs.stream.object_detection, since ) >= MIN_PD_FRAMES ) == pd_on
-        assert ( frames.count( rs.stream.occupancy, since ) >= MIN_OCC_FRAMES ) == occ_on
-        assert mux_state( device, PD_ID )[0] == pd_on and mux_state( device, OCC_ID )[0] == occ_on
+        end = time.monotonic()
+        for stream_type, enabled, minimum in ( ( rs.stream.object_detection, pd_on, MIN_PD_FRAMES ),
+                                               ( rs.stream.occupancy, occ_on, MIN_OCC_FRAMES ) ):
+            if enabled:
+                frames.check_active( stream_type, since, end, minimum )
+            else:
+                assert frames.count( stream_type, since ) == 0, f"Disabled {stream_type} still delivers frames"
+        active = int( pd_on or occ_on )
+        assert mux_state( device, PD_ID ) == ( int(pd_on), int(pd_on), active )
+        assert mux_state( device, OCC_ID ) == ( int(occ_on), int(occ_on), active )
 
     def start(s, p):
         s.open( p )
@@ -246,10 +261,11 @@ def test_occ_start_order(device):
     pd.start( frames )
     since = time.monotonic()
     time.sleep( DURATION_S )
+    end = time.monotonic()
     stop( [pd, mapping] )
     stop( inputs )
-    assert frames.count( rs.stream.object_detection, since ) >= MIN_PD_FRAMES
-    assert frames.count( rs.stream.occupancy, since ) >= MIN_OCC_FRAMES
+    frames.check_active( rs.stream.object_detection, since, end, MIN_PD_FRAMES )
+    frames.check_active( rs.stream.occupancy, since, end, MIN_OCC_FRAMES )
 
 
 def test_stale_request_cleared(device):
