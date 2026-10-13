@@ -1,12 +1,12 @@
 # License: Apache 2.0. See LICENSE file in root directory.
 # Copyright(c) 2026 RealSense, Inc. All Rights Reserved.
 
-# GMSL Perception MUX: Object Detection (PD) and Occupancy (OCC) time-share the GMSL IR channel and are told apart
-# by their metadata. Each stream is still its own sensor and opens and closes independently; the camera starts the
-# shared capture with the first and stops it with the last. PD and OCC can each run without ordinary captures.
+# GMSL Perception MUX: PD, Occupancy, and LPCL time-share the GMSL IR channel and are told apart
+# by their metadata. OCC and LPCL are alternative profiles of one Mapping sensor; PD is independent.
+# The camera starts shared capture with the first open sensor and stops it with the last.
 # Standalone PD on every transport is covered by pytest-pd-standalone.py.
 #
-# Both 3C and 2C expose Occupancy when the camera firmware supports the Mapping output.
+# Both 3C and 2C expose Occupancy and LPCL; LPCL requires the large RSVL carrier.
 
 import pytest
 import pyrealsense2 as rs
@@ -24,7 +24,7 @@ pytestmark = [
 DURATION_S = 4
 MIN_PD_FRAMES = 10                    # PD runs at ~15 fps
 MIN_OCC_FRAMES = 60                   # OCC runs at ~30 fps
-PD_ID, OCC_ID = 6, 7                  # stream ids of the camera's MUX control (HWMC 0xC0)
+PD_ID, OCC_ID, LPCL_ID = 6, 7, 8     # stream ids of the camera's MUX control (HWMC 0xC0)
 MUX_CONTROL, MUX_SET_ENABLE, MUX_GET_STATE = 0xC0, 1, 2
 
 
@@ -53,6 +53,10 @@ def is_3c(dev):
     return int( dev.get_info( rs.camera_info.product_id ), 16 ) in ( 0x0B6A, 0x0C05, 0x0C06, 0x0C08 )
 
 
+def lpcl_supported(dev):
+    return int( dev.get_info( rs.camera_info.product_id ), 16 ) in ( 0x0C07, 0x0C08 )
+
+
 def profile(s, stream_type, fmt, w=1280, h=720, index=None):
     for p in s.get_stream_profiles():
         vp = p.as_video_stream_profile()
@@ -70,6 +74,11 @@ def pd_profile(dev):
 def occ_profile(dev):
     return next( p for p in sensor( dev, 'Depth Mapping Camera' ).get_stream_profiles()
                  if p.stream_type() == rs.stream.occupancy )
+
+
+def lpcl_profile(dev):
+    return next( p for p in sensor( dev, 'Depth Mapping Camera' ).get_stream_profiles()
+                 if p.stream_type() == rs.stream.labeled_point_cloud )
 
 
 def mux_state(dev, stream_id):
@@ -140,6 +149,85 @@ def test_perception_sensors_enumerate(device):
     assert ( occ.format(), occ.width(), occ.height(), occ.fps() ) == ( rs.format.y8, 320, 256, 30 )
     assert mux_state( device, PD_ID ) == ( 0, 0, 0 )
     assert mux_state( device, OCC_ID ) == ( 0, 0, 0 )
+
+    mapping_types = { p.stream_type() for p in sensor( device, 'Depth Mapping Camera' ).get_stream_profiles() }
+    if lpcl_supported( device ):
+        lpcl = lpcl_profile( device ).as_video_stream_profile()
+        assert ( lpcl.format(), lpcl.width(), lpcl.height(), lpcl.fps() ) == ( rs.format.y8, 640, 360, 30 )
+        assert mux_state( device, LPCL_ID ) == ( 0, 0, 0 )
+    else:
+        assert rs.stream.labeled_point_cloud not in mapping_types
+
+
+def test_lpcl_standalone_and_pd_late_open(device):
+    """LPCL needs no ordinary input; PD can join its already-large shared queue."""
+    if not lpcl_supported( device ):
+        pytest.skip( "LPCL is unavailable on this SKU" )
+    mapping, pd = sensor( device, 'Depth Mapping Camera' ), sensor( device, 'Perception' )
+    frames = Collector()
+    mapping.open( lpcl_profile( device ) )
+    mapping.start( frames )
+    time.sleep( DURATION_S )
+    assert frames.count( rs.stream.labeled_point_cloud ) >= MIN_OCC_FRAMES
+    pd.open( pd_profile( device ) )
+    pd.start( frames )
+    since = time.monotonic() + 0.6
+    time.sleep( DURATION_S )
+    assert frames.count( rs.stream.labeled_point_cloud, since ) >= MIN_OCC_FRAMES
+    assert frames.count( rs.stream.object_detection, since ) >= MIN_PD_FRAMES
+    assert mux_state( device, PD_ID ) == ( 1, 1, 1 )
+    assert mux_state( device, LPCL_ID ) == ( 1, 1, 1 )
+    stop( [pd, mapping] )
+    assert wait_state( device, LPCL_ID, ( 0, 0, 0 ) ) == ( 0, 0, 0 )
+    assert all( f['size'] == 2995200 for f in frames.frames[rs.stream.labeled_point_cloud] )
+
+
+def test_pd_then_lpcl_without_reallocating_capture(device):
+    """The SDK reserves 1024x2925 before its first PD-only capture."""
+    if not lpcl_supported( device ):
+        pytest.skip( "LPCL is unavailable on this SKU" )
+    pd, mapping = sensor( device, 'Perception' ), sensor( device, 'Depth Mapping Camera' )
+    frames = Collector()
+    pd.open( pd_profile( device ) )
+    pd.start( frames )
+    time.sleep( DURATION_S )
+    mapping.open( lpcl_profile( device ) )
+    mapping.start( frames )
+    since = time.monotonic() + 0.6
+    time.sleep( DURATION_S )
+    assert frames.count( rs.stream.object_detection, since ) >= MIN_PD_FRAMES
+    assert frames.count( rs.stream.labeled_point_cloud, since ) >= MIN_OCC_FRAMES
+    stop( [mapping] )
+    since = time.monotonic() + 0.6
+    time.sleep( DURATION_S )
+    assert frames.count( rs.stream.object_detection, since ) >= MIN_PD_FRAMES
+    stop( [pd] )
+    assert wait_state( device, PD_ID, ( 0, 0, 0 ) ) == ( 0, 0, 0 )
+    assert wait_state( device, LPCL_ID, ( 0, 0, 0 ) ) == ( 0, 0, 0 )
+
+
+def test_lpcl_to_pd_and_occ_without_pause(device):
+    """PD and OCC can start immediately after LPCL closes, without an app-side sleep."""
+    if not lpcl_supported( device ):
+        pytest.skip( "LPCL is unavailable on this SKU" )
+    pd, mapping = sensor( device, 'Perception' ), sensor( device, 'Depth Mapping Camera' )
+    for _ in range( 2 ):
+        lpcl_frames, frames = Collector(), Collector()
+        mapping.open( lpcl_profile( device ) )
+        mapping.start( lpcl_frames )
+        time.sleep( 1 )
+        stop( [mapping] )
+        pd.open( pd_profile( device ) )
+        pd.start( frames )
+        mapping.open( occ_profile( device ) )
+        mapping.start( frames )
+        since = time.monotonic() + 0.6
+        time.sleep( DURATION_S )
+        assert frames.count( rs.stream.object_detection, since ) >= MIN_PD_FRAMES
+        assert frames.count( rs.stream.occupancy, since ) >= MIN_OCC_FRAMES
+        assert mux_state( device, PD_ID ) == ( 1, 1, 1 )
+        assert mux_state( device, OCC_ID ) == ( 1, 1, 1 )
+        stop( [pd, mapping] )
 
 
 def test_pd_open_close_twice(device):
