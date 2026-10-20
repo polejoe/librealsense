@@ -2682,11 +2682,11 @@ namespace rs2
                         }
                         if (can_stream)
                         {
-                            // Object detection overlays need Color and exclude embedded filters.
-                            // Over GMSL perception and infrared share the IR channel.
+                            // MIPI sensor.open() checks actual filter state; legacy UVC UI toggles are not authoritative.
+                            bool const mipi_device = fw_update::is_mipi_device( dev );
                             bool blocking_filter_enabled = subdevice_has_stream_enabled( *sub, RS2_STREAM_OBJECT_DETECTION )
-                                                        && is_perception_blocking_filter_enabled();
-                            bool blocking_ir_active = subdevice_has_perception( *sub ) && fw_update::is_mipi_device( dev )
+                                                        && ! mipi_device && is_perception_blocking_filter_enabled();
+                            bool blocking_ir_active = subdevice_has_perception( *sub ) && mipi_device
                                                    && is_stream_active( RS2_STREAM_INFRARED );
                             bool missing_color = subdevice_needs_color( *sub ) && ! is_stream_active( RS2_STREAM_COLOR );
                             bool disable_perception = missing_color || blocking_filter_enabled || blocking_ir_active;
